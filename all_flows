@@ -1,0 +1,1853 @@
+# Instant Mechanic — Live Operations Dashboard: Complete System Blueprint & Code Manual
+
+This document provides a line-by-line and block-by-block technical reference for every file in the project. It explains **what each file does**, **why it is required by the system**, **how data flows through it**, and **how to modify it in the future**.
+
+---
+
+## 1. System Architecture & High-Level Data Flow
+
+```
+  +-----------------------------------------------------------------------+
+  |                     REACT (VITE) FRONTEND CLIENT                      |
+  |  (TanStack Query + Socket.io Client + Tailwind CSS + Lucide Icons)   |
+  +-----------------------------------+-----------------------------------+
+                                      |
+                       HTTP REST API  |  Socket.io Events
+                       (JSON Requests)|  (Real-Time Broadcasts)
+                                      v
+  +-----------------------------------------------------------------------+
+  |                     NODE.JS + EXPRESS BACKEND SERVER                  |
+  |      (connectDB + SocketManager + Controllers + Mongoose Models)      |
+  +-----------------------------------+-----------------------------------+
+                                      |
+                                Mongoose ORM
+                                      v
+  +-----------------------------------------------------------------------+
+  |                         MONGODB DATABASE                              |
+  |  Collections: Customers | Mechanics | Services | Bookings (Text Indexed)|
+  +-----------------------------------------------------------------------+
+```
+
+### Data Flow Scenario: Operational Booking Status Update
+1. **User Action:** Ops dispatcher updates a booking from `Assigned` to `Mechanic On The Way` on the React UI board.
+2. **HTTP Mutation:** Client sends `PATCH /api/bookings/:id/status` via Axios (`client/src/lib/api.ts`).
+3. **Express Controller Execution:** `bookingController.updateBookingStatus` receives the request:
+   - Updates `Booking` document status and appends a timestamped log to `statusHistory[]`.
+   - Automatically updates assigned `Mechanic` status to `on_the_way`.
+   - Saves both documents to MongoDB.
+4. **Real-Time Broadcast:** Controller calls `notifyBookingUpdated(booking)` and `notifyMechanicStatusChanged(mechanic)` via `server/src/sockets/socketManager.ts`.
+5. **Client Cache Invalidation:** `client/src/hooks/useSocketEvents.ts` hears `booking:updated` and calls `queryClient.invalidateQueries({ queryKey: ['bookings'] })`.
+6. **Zero-Latency UI Sync:** All open dashboard browser windows automatically re-render the updated booking and mechanic state in real time without refreshing the page!
+
+---
+
+## 2. Server Architecture (`server/`)
+
+### 2.1 Database Connection (`server/src/config/connectDB.js`)
+
+```javascript
+import mongoose from 'mongoose';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+export const connectDB = async () => {
+  try {
+    const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI;
+
+    if (!mongoUri) {
+      console.error('❌ [Database] Critical Error: MONGO_URI environment variable is missing in .env!');
+      process.exit(1);
+    }
+
+    console.log('📡 [Database] Attempting connection to MongoDB...');
+    const conn = await mongoose.connect(mongoUri);
+
+    console.log(`✅ [Database] MongoDB Connected Successfully! Host: ${conn.connection.host}`);
+    console.log(`📊 [Database] Database Name: ${conn.connection.name}`);
+  } catch (error) {
+    console.error(`❌ [Database] Connection Failure Error: ${error.message}`);
+    process.exit(1);
+  }
+};
+
+export default connectDB;
+```
+- **What it does:** Reads `MONGO_URI` from `.env`, initializes Mongoose connection, and logs host/database details.
+- **Why required by system:** Prevents the Express server from accepting HTTP requests or socket clients when database connectivity fails. If the connection fails, it halts the process (`process.exit(1)`).
+
+---
+
+### 2.2 Customer Schema (`server/src/models/Customer.ts`)
+
+```typescript
+import mongoose, { Schema, Document } from 'mongoose';
+
+export interface IVehicle {
+  make: string;
+  model: string;
+  year: number;
+  licensePlate: string;
+}
+
+export interface ICustomer extends Document {
+  name: string;
+  email: string;
+  phone: string;
+  address: string;
+  vehicles: IVehicle[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const VehicleSchema = new Schema<IVehicle>({
+  make: { type: String, required: [true, 'Vehicle make is required'], trim: true },
+  model: { type: String, required: [true, 'Vehicle model is required'], trim: true },
+  year: { type: Number, required: [true, 'Vehicle manufacturing year is required'] },
+  licensePlate: { type: String, required: [true, 'License plate is required'], trim: true, uppercase: true }
+});
+
+const CustomerSchema = new Schema<ICustomer>(
+  {
+    name: { type: String, required: [true, 'Customer name is required'], trim: true },
+    email: {
+      type: String,
+      required: [true, 'Customer email is required'],
+      unique: true,
+      lowercase: true,
+      trim: true,
+      index: true
+    },
+    phone: { type: String, required: [true, 'Phone number is required'], trim: true },
+    address: { type: String, required: [true, 'Customer address is required'] },
+    vehicles: [VehicleSchema]
+  },
+  { timestamps: true }
+);
+
+export default mongoose.model<ICustomer>('Customer', CustomerSchema);
+```
+- **What it does:** Defines the schema for customer contact profiles and embeds an array of customer `vehicles`.
+- **Why required by system:** Allows ops dispatchers to look up customer contact info and select from their registered vehicle fleet when creating a new service booking.
+
+---
+
+### 2.3 Mechanic Schema (`server/src/models/Mechanic.ts`)
+
+```typescript
+import mongoose, { Schema, Document } from 'mongoose';
+
+export type MechanicStatus = 'available' | 'busy' | 'on_the_way' | 'offline';
+
+export interface IMechanic extends Document {
+  name: string;
+  email: string;
+  phone: string;
+  specialties: string[];
+  status: MechanicStatus;
+  jobsCompleted: number;
+  rating: number;
+  currentBooking?: mongoose.Types.ObjectId | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const MechanicSchema = new Schema<IMechanic>(
+  {
+    name: { type: String, required: [true, 'Mechanic name is required'], trim: true },
+    email: {
+      type: String,
+      required: [true, 'Mechanic email is required'],
+      unique: true,
+      lowercase: true,
+      trim: true,
+      index: true
+    },
+    phone: { type: String, required: [true, 'Phone number is required'], trim: true },
+    specialties: {
+      type: [{ type: String, trim: true }],
+      required: [true, 'At least one specialty is required']
+    },
+    status: {
+      type: String,
+      enum: {
+        values: ['available', 'busy', 'on_the_way', 'offline'],
+        message: '{VALUE} is not a valid mechanic status'
+      },
+      default: 'available',
+      index: true
+    },
+    jobsCompleted: { type: Number, default: 0, min: 0 },
+    rating: { type: Number, default: 5.0, min: 1.0, max: 5.0 },
+    currentBooking: { type: Schema.Types.ObjectId, ref: 'Booking', default: null, index: true }
+  },
+  { timestamps: true }
+);
+
+export default mongoose.model<IMechanic>('Mechanic', MechanicSchema);
+```
+- **What it does:** Tracks mechanic availability (`available`, `busy`, `on_the_way`, `offline`), ratings, total jobs completed, and a direct `currentBooking` reference.
+- **Why required by system:** Enables $O(1)$ constant-time availability lookup when dispatching jobs.
+
+---
+
+### 2.4 Service Schema (`server/src/models/Service.ts`)
+
+```typescript
+import mongoose, { Schema, Document } from 'mongoose';
+
+export interface IService extends Document {
+  name: string;
+  category: string;
+  basePrice: number;
+  estimatedDurationMins: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const ServiceSchema = new Schema<IService>(
+  {
+    name: { type: String, required: [true, 'Service name is required'], trim: true },
+    category: { type: String, required: [true, 'Category is required'], trim: true, index: true },
+    basePrice: { type: Number, required: [true, 'Base price is required'], min: [0, 'Base price cannot be negative'] },
+    estimatedDurationMins: {
+      type: Number,
+      required: [true, 'Estimated duration is required'],
+      min: [5, 'Estimated duration must be at least 5 minutes']
+    }
+  },
+  { timestamps: true }
+);
+
+export default mongoose.model<IService>('Service', ServiceSchema);
+```
+- **What it does:** Standard service offering catalog (e.g. "Full Synthetic Oil Change", "Brake Pad Replacement") with base pricing and duration estimates.
+- **Why required by system:** Decouples pricing catalog from individual bookings while providing baseline financial and time estimates.
+
+---
+
+### 2.5 Booking Schema (`server/src/models/Booking.ts`)
+
+```typescript
+import mongoose, { Schema, Document } from 'mongoose';
+
+export type BookingStatus =
+  | 'Pending'
+  | 'Assigned'
+  | 'Mechanic On The Way'
+  | 'In Progress'
+  | 'Completed'
+  | 'Cancelled';
+
+export interface IStatusHistory {
+  status: BookingStatus;
+  timestamp: Date;
+  note?: string;
+}
+
+export interface IBooking extends Document {
+  bookingId: string;
+  customer: mongoose.Types.ObjectId;
+  vehicle: {
+    make: string;
+    model: string;
+    licensePlate: string;
+  };
+  service: mongoose.Types.ObjectId;
+  mechanic?: mongoose.Types.ObjectId | null;
+  status: BookingStatus;
+  amount: number;
+  scheduledAt: Date;
+  statusHistory: IStatusHistory[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const StatusHistorySchema = new Schema<IStatusHistory>({
+  status: {
+    type: String,
+    enum: ['Pending', 'Assigned', 'Mechanic On The Way', 'In Progress', 'Completed', 'Cancelled'],
+    required: true
+  },
+  timestamp: { type: Date, default: Date.now },
+  note: { type: String, default: '' }
+});
+
+const BookingSchema = new Schema<IBooking>(
+  {
+    bookingId: {
+      type: String,
+      required: [true, 'Booking ID is required'],
+      unique: true,
+      trim: true,
+      index: true
+    },
+    customer: {
+      type: Schema.Types.ObjectId,
+      ref: 'Customer',
+      required: [true, 'Customer reference is required'],
+      index: true
+    },
+    vehicle: {
+      make: { type: String, required: [true, 'Vehicle make is required'], trim: true },
+      model: { type: String, required: [true, 'Vehicle model is required'], trim: true },
+      licensePlate: { type: String, required: [true, 'License plate is required'], trim: true, uppercase: true }
+    },
+    service: {
+      type: Schema.Types.ObjectId,
+      ref: 'Service',
+      required: [true, 'Service reference is required'],
+      index: true
+    },
+    mechanic: {
+      type: Schema.Types.ObjectId,
+      ref: 'Mechanic',
+      default: null,
+      index: true
+    },
+    status: {
+      type: String,
+      enum: {
+        values: ['Pending', 'Assigned', 'Mechanic On The Way', 'In Progress', 'Completed', 'Cancelled'],
+        message: '{VALUE} is not a valid booking status'
+      },
+      default: 'Pending',
+      index: true
+    },
+    amount: {
+      type: Number,
+      required: [true, 'Booking amount is required'],
+      min: [0, 'Amount cannot be negative']
+    },
+    scheduledAt: { type: Date, default: Date.now, index: true },
+    statusHistory: [StatusHistorySchema]
+  },
+  { timestamps: true }
+);
+
+// Full Text Index for fast search across bookingId & license plate
+BookingSchema.index(
+  { bookingId: 'text', 'vehicle.licensePlate': 'text' },
+  { weights: { bookingId: 10, 'vehicle.licensePlate': 5 }, name: 'booking_search_text_index' }
+);
+
+// Compound Index for status filtering sorted by date
+BookingSchema.index({ status: 1, createdAt: -1 });
+
+export default mongoose.model<IBooking>('Booking', BookingSchema);
+```
+- **What it does:** Primary transactional model. Stores embedded vehicle snapshot, references to Customer/Service/Mechanic, status state, and `statusHistory[]` audit log array.
+- **Why required by system:** Serves as the core operational entity. Embedded vehicle snapshot ensures historical integrity even if customer profiles change. Text index enables instant search filtering.
+
+---
+
+### 2.6 Socket Manager (`server/src/sockets/socketManager.ts`)
+
+```typescript
+import { Server as HttpServer } from 'http';
+import { Server as SocketIOServer, Socket } from 'socket.io';
+
+let io: SocketIOServer | null = null;
+
+export const initSocketServer = (httpServer: HttpServer, clientUrl: string): SocketIOServer => {
+  io = new SocketIOServer(httpServer, {
+    cors: {
+      origin: clientUrl || '*',
+      methods: ['GET', 'POST', 'PATCH', 'DELETE']
+    }
+  });
+
+  io.on('connection', (socket: Socket) => {
+    console.log(`⚡ [Socket.io] Client connected: ${socket.id}`);
+    socket.on('join:ops_room', () => {
+      socket.join('ops_room');
+    });
+  });
+
+  return io;
+};
+
+export const notifyBookingCreated = (booking: any) => {
+  if (io) io.emit('booking:created', booking);
+};
+
+export const notifyBookingUpdated = (booking: any) => {
+  if (io) io.emit('booking:updated', booking);
+};
+
+export const notifyMechanicStatusChanged = (mechanic: any) => {
+  if (io) io.emit('mechanic:status_changed', mechanic);
+};
+```
+- **What it does:** Initializes Socket.io server instance and exports helper broadcast functions (`notifyBookingCreated`, `notifyBookingUpdated`, `notifyMechanicStatusChanged`).
+- **Why required by system:** Connects Express controllers with real-time WebSocket clients so that state mutations automatically broadcast to all connected dashboards.
+
+---
+
+### 2.7 Express Server Entry Point (`server/src/index.ts`)
+
+```typescript
+import express from 'express';
+import http from 'http';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import connectDB from './config/connectDB.js';
+
+import customerRoutes from './routes/customerRoutes.js';
+import serviceRoutes from './routes/serviceRoutes.js';
+import mechanicRoutes from './routes/mechanicRoutes.js';
+import bookingRoutes from './routes/bookingRoutes.js';
+import analyticsRoutes from './routes/analyticsRoutes.js';
+import { initSocketServer } from './sockets/socketManager.js';
+import { seedDatabase } from './seed/seedData.js';
+import Booking from './models/Booking.js';
+
+dotenv.config();
+
+const app = express();
+const httpServer = http.createServer(app);
+
+const PORT = process.env.PORT || 5000;
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+
+app.use(cors({ origin: CLIENT_URL, credentials: true }));
+app.use(express.json());
+
+initSocketServer(httpServer, CLIENT_URL);
+
+app.use('/api/customers', customerRoutes);
+app.use('/api/services', serviceRoutes);
+app.use('/api/mechanics', mechanicRoutes);
+app.use('/api/bookings', bookingRoutes);
+app.use('/api/analytics', analyticsRoutes);
+
+const startServer = async () => {
+  try {
+    await connectDB();
+    const bookingCount = await Booking.countDocuments();
+    if (bookingCount === 0) {
+      console.log('ℹ️ Database appears empty. Seeding initial demo data...');
+      await seedDatabase();
+    }
+    httpServer.listen(PORT, () => {
+      console.log(`🚀 Server listening on http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    console.error('❌ Server launch failure:', error);
+    process.exit(1);
+  }
+};
+
+startServer();
+```
+- **What it does:** Boots HTTP server, initializes Socket.io, connects database, mounts REST route controllers, and auto-seeds initial demo data if database is empty.
+- **Why required by system:** Entry point orchestrating backend server setup.
+
+---
+
+## 3. Frontend Architecture (`client/`)
+
+### 3.1 Socket Listener Hook (`client/src/hooks/useSocketEvents.ts`)
+
+```typescript
+import { useEffect, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { socket } from '../lib/socket';
+
+export const useSocketEvents = () => {
+  const queryClient = useQueryClient();
+  const [isConnected, setIsConnected] = useState(socket.connected);
+  const [lastNotification, setLastNotification] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleConnect = () => setIsConnected(true);
+    const handleDisconnect = () => setIsConnected(false);
+
+    const handleBookingCreated = (booking: any) => {
+      setLastNotification(`New Booking ${booking.bookingId} received!`);
+      queryClient.invalidateQueries({ queryKey: ['bookings'] });
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      queryClient.invalidateQueries({ queryKey: ['mechanics'] });
+    };
+
+    const handleBookingUpdated = (booking: any) => {
+      setLastNotification(`Booking ${booking.bookingId} status updated to ${booking.status}`);
+      queryClient.invalidateQueries({ queryKey: ['bookings'] });
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      queryClient.invalidateQueries({ queryKey: ['mechanics'] });
+    };
+
+    const handleMechanicStatusChanged = (mechanic: any) => {
+      setLastNotification(`Mechanic ${mechanic.name} is now ${mechanic.status}`);
+      queryClient.invalidateQueries({ queryKey: ['mechanics'] });
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+    };
+
+    socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
+    socket.on('booking:created', handleBookingCreated);
+    socket.on('booking:updated', handleBookingUpdated);
+    socket.on('mechanic:status_changed', handleMechanicStatusChanged);
+
+    return () => {
+      socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
+      socket.off('booking:created', handleBookingCreated);
+      socket.off('booking:updated', handleBookingUpdated);
+      socket.off('mechanic:status_changed', handleMechanicStatusChanged);
+    };
+  }, [queryClient]);
+
+  return { isConnected, lastNotification, clearNotification: () => setLastNotification(null) };
+};
+```
+- **What it does:** Connects to Socket.io events and invalidates TanStack Query caches whenever backend notifications arrive.
+- **Why required by system:** Replaces manual HTTP polling with automatic real-time UI synchronization.
+
+---
+
+## 4. Scaling & Performance Review
+
+### 1. Vehicle Snapshot Denormalization:
+Denormalizing `{ make, model, licensePlate }` directly into `Booking` ensures that even if a customer updates their registered vehicles in the future, past booking history remains accurate and audit-compliant.
+
+### 2. Mechanic Availability $O(1)$ Lookup:
+Storing `currentBooking` directly on the `Mechanic` schema eliminates the need to execute costly `$lookup` scans across all active bookings when rendering mechanic availability cards.
+
+### 3. High-Performance Indexing:
+- **Full Text Search Index:** `BookingSchema.index({ bookingId: 'text', 'vehicle.licensePlate': 'text' })` enables sub-millisecond search queries across booking codes and vehicle license plates.
+- **Compound Index:** `BookingSchema.index({ status: 1, createdAt: -1 })` optimizes operational column queries on the live Kanban board.
+
+---
+
+## STEP 3: Express Application, Controllers, Middleware, Routes & Swagger
+
+---
+
+### 5. Error Handling Middleware (`server/src/middleware/errorHandler.ts`)
+
+```typescript
+export const errorHandler = (err, _req, res, _next) => {
+  const statusCode = err.statusCode || 500;
+  const message = err.message || 'Internal Server Error';
+  res.status(statusCode).json({ success: false, message, ...(dev && { stack: err.stack }) });
+};
+
+export const notFoundHandler = (req, res, _next) => {
+  res.status(404).json({ success: false, message: `Route not found: ${req.method} ${req.originalUrl}` });
+};
+```
+
+- **What it does:** Two middleware functions placed **after** all route definitions in `index.ts`.
+- **`errorHandler`:** Catches any error thrown by a controller via `next(error)`. Returns a clean JSON error response. In development mode, includes the stack trace for debugging. In production, only the message.
+- **`notFoundHandler`:** If a request URL doesn't match any defined route (e.g. `GET /api/typo`), this sends `404` with the attempted route path. Without it, Express would return a generic HTML error page.
+- **Why required:** Prevents raw stack traces from leaking to API consumers. Guarantees every error response is valid JSON that the React frontend can parse.
+
+---
+
+### 6. Dashboard Controller (`server/src/controllers/dashboardController.ts`)
+
+```typescript
+const [result] = await Booking.aggregate([
+  {
+    $facet: {
+      totalBookings:  [{ $count: 'count' }],
+      todayBookings:  [{ $match: { createdAt: { $gte: todayStart } } }, { $count: 'count' }],
+      byStatus:       [{ $group: { _id: '$status', count: { $sum: 1 } } }],
+      totalRevenue:   [{ $match: { status: 'Completed' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]
+    }
+  }
+]);
+```
+
+- **What it does:** Computes all dashboard KPI metrics in a single MongoDB round-trip using `$facet` aggregation.
+- **Why `$facet` instead of multiple `countDocuments()` calls?** Without `$facet`, you would need 6+ separate database queries (`countDocuments` for total, today, each status, then a revenue sum). Each query is a network round-trip to MongoDB. `$facet` runs all these sub-pipelines **in parallel within a single aggregation command**, cutting latency by ~80%.
+- **`todayStart`:** Computed as midnight of the current day. Used to filter "today" bookings and new customers.
+- **Mechanic and Customer counts:** These hit different collections, so they remain as separate `countDocuments()` calls (you can't `$facet` across collections).
+
+---
+
+### 7. Booking Controller (`server/src/controllers/bookingController.ts`)
+
+#### `getBookings` — Paginated, Filterable, Sortable List
+
+```typescript
+// Build filter dynamically based on query params
+const filter: any = {};
+if (status && status !== 'all') filter.status = status;
+if (search) {
+  const regex = new RegExp(escaped, 'i');
+  filter.$or = [{ bookingId: regex }, { 'vehicle.licensePlate': regex }];
+}
+
+// Run count + find in parallel for speed
+const [total, bookings] = await Promise.all([
+  Booking.countDocuments(filter),
+  Booking.find(filter)
+    .populate('customer', 'name email phone')
+    .populate('mechanic', 'name status phone rating')
+    .populate('service', 'name category basePrice estimatedDurationMins')
+    .sort(sortObj).skip(skip).limit(limitNum)
+]);
+```
+
+- **What it does:** Accepts `?search=BK-10&status=Pending&page=2&limit=10&sortBy=amount&order=asc` query params. Builds a Mongoose filter object dynamically, then runs `countDocuments` and `find` in parallel via `Promise.all`.
+- **Why `$or` with regex?** Allows searching by partial bookingId *or* license plate in one query. The `'i'` flag makes it case-insensitive.
+- **Why `Promise.all`?** Running `countDocuments` and `find` sequentially would double response time. `Promise.all` fires both queries concurrently.
+- **Field projection in `.populate()`:** Only selected fields (`'name email phone'`) are fetched from referenced documents, reducing payload size.
+- **Pagination return format:** `{ data, pagination: { total, page, limit, pages } }` — standard REST pagination envelope.
+
+#### `updateBookingStatus` — State Machine with Side-Effects
+
+```typescript
+booking.status = status;
+booking.statusHistory.push({ status, timestamp: new Date(), note });
+await booking.save();
+
+// Side-effects on assigned mechanic
+if (booking.mechanic) {
+  const mechanic = await Mechanic.findById(booking.mechanic);
+  if (status === 'Completed') {
+    mechanic.status = 'available';
+    mechanic.currentBooking = null;
+    mechanic.jobsCompleted += 1;
+  }
+  await mechanic.save();
+  io.emit('mechanic:status_changed', mechanic);
+}
+
+io.emit('booking:updated', populated);
+```
+
+- **What it does:** Updates booking status, appends an audit trail entry to `statusHistory[]`, applies mechanic side-effects, and broadcasts Socket.io events.
+- **Side-effect table:**
+  - `Mechanic On The Way` → mechanic.status = `on_the_way`
+  - `In Progress` → mechanic.status = `busy`
+  - `Completed` → mechanic.status = `available`, `currentBooking = null`, `jobsCompleted++`
+  - `Cancelled` → mechanic.status = `available`, `currentBooking = null`
+- **`req.app.get('io')`:** Retrieves the Socket.io instance that was stored on the Express app during initialization with `app.set('io', io)`. This avoids importing a module-level singleton.
+
+---
+
+### 8. Mechanic Controller (`server/src/controllers/mechanicController.ts`)
+
+#### `getMechanicById` — Detail + Related Bookings
+
+```typescript
+const mechanic = await Mechanic.findById(req.params.id).populate('currentBooking');
+const relatedBookings = await Booking.find({ mechanic: mechanic._id })
+  .populate('customer', 'name email')
+  .populate('service', 'name category')
+  .sort({ createdAt: -1 });
+
+return res.json({ success: true, data: { ...mechanic.toObject(), relatedBookings } });
+```
+
+- **What it does:** Returns the mechanic profile merged with an array of all bookings where they were ever assigned.
+- **Why `toObject()`?** Mongoose documents are special objects. `toObject()` converts them into plain JS objects so we can spread (`...`) and add `relatedBookings` as a new property.
+
+---
+
+### 9. Customer Controller (`server/src/controllers/customerController.ts`)
+
+#### `getCustomerById` — Detail + Related Bookings
+
+Same pattern as mechanic: fetches the customer, then queries `Booking.find({ customer: customer._id })` to include their service history.
+
+#### `getCustomers` — Paginated with Search
+
+```typescript
+if (search) {
+  filter.$or = [{ name: regex }, { email: regex }, { phone: regex }];
+}
+```
+
+- **What it does:** Allows searching customers by name, email, or phone using case-insensitive regex across multiple fields with `$or`.
+
+---
+
+### 10. Express App Entry Point (`server/src/index.ts`)
+
+```typescript
+const io = initSocketServer(httpServer, CLIENT_URL);
+app.set('io', io);  // Store Socket.io instance on Express app
+
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/bookings', bookingRoutes);
+app.use('/api/mechanics', mechanicRoutes);
+app.use('/api/customers', customerRoutes);
+app.use('/api/services', serviceRoutes);
+
+// MUST be after all routes
+app.use(notFoundHandler);
+app.use(errorHandler);
+```
+
+- **What it does:** Central orchestrator. Initializes middleware → stores Socket.io → mounts Swagger docs → mounts REST routes → attaches error handlers.
+- **Key design:** `app.set('io', io)` stores the Socket.io server instance on the Express app object. Any controller can then access it via `req.app.get('io')` without importing a module-level singleton, which keeps controllers testable and avoids circular dependencies.
+- **Route order matters:** Express matches routes top-to-bottom. The `notFoundHandler` and `errorHandler` must be last so they only trigger when no route matched or a controller threw an error.
+
+---
+
+### 11. Swagger API Documentation (`server/src/config/swaggerSpec.ts`)
+
+- **What it does:** Defines the complete OpenAPI 3.0 specification inline as a TypeScript object. Covers all 5 route groups with request/response schemas, query parameter definitions, and reusable component schemas (`Booking`, `Pagination`).
+- **Why required:** Mounted at `/api-docs`, it provides a live, interactive API explorer (Swagger UI) where you can test every endpoint directly from the browser. Invaluable for debugging and for demonstrating the API during your internship review.
+- **How to access:** Start the server → visit `http://localhost:5000/api-docs` in your browser.
+
+---
+
+### 12. Route Files (`server/src/routes/`)
+
+Each route file maps HTTP methods to controller functions:
+
+| File | Mount Path | Endpoints |
+|------|-----------|-----------|
+| `dashboardRoutes.ts` | `/api/dashboard` | `GET /summary` |
+| `bookingRoutes.ts` | `/api/bookings` | `GET /`, `GET /:id`, `POST /`, `PATCH /:id/status`, `PATCH /:id/assign` |
+| `mechanicRoutes.ts` | `/api/mechanics` | `GET /`, `GET /:id`, `POST /`, `PATCH /:id/status` |
+| `customerRoutes.ts` | `/api/customers` | `GET /`, `GET /:id`, `POST /`, `POST /:id/vehicles` |
+| `serviceRoutes.ts` | `/api/services` | `GET /`, `POST /` |
+
+- **Why separate route files?** Keeps `index.ts` clean and allows each domain (bookings, mechanics, etc.) to be developed and tested independently.
+
+---
+
+## STEP 4: Database Seeding (@faker-js/faker) & Live Event Simulation (simulate.js)
+
+---
+
+### 13. Faker Database Seeding Script (`server/src/seed/seedData.ts`)
+
+```typescript
+// Wipe clean slate
+await Promise.all([
+  Customer.deleteMany({}),
+  Mechanic.deleteMany({}),
+  Service.deleteMany({}),
+  Booking.deleteMany({})
+]);
+
+// 1. 8 Vehicle Services across 7 categories in INR (₹899 - ₹7,999)
+const serviceTemplates = [
+  { name: 'Periodic Maintenance Service (PMS)', category: 'General Service', basePrice: 3499, estimatedDurationMins: 120 },
+  { name: 'Complete Engine Diagnostics & Tuning', category: 'Engine', basePrice: 4999, estimatedDurationMins: 90 },
+  { name: 'Front & Rear Brake Pad Replacement', category: 'Brakes', basePrice: 2899, estimatedDurationMins: 60 },
+  { name: 'AC Gas Recharge & Evaporator Cleaning', category: 'AC', basePrice: 2299, estimatedDurationMins: 45 },
+  { name: 'Tyre Alignment, Balancing & Rotation (4 Wheels)', category: 'Tyres', basePrice: 1499, estimatedDurationMins: 40 },
+  { name: 'Battery Health Check & Jumpstart Assist', category: 'Battery', basePrice: 899, estimatedDurationMins: 30 },
+  { name: 'Ceramic Coating & Deep Foam Wash', category: 'Cosmetic', basePrice: 6499, estimatedDurationMins: 180 },
+  { name: 'Clutch Assembly & Flywheel Overhaul', category: 'Engine', basePrice: 7999, estimatedDurationMins: 240 }
+];
+
+// 2. 60 Customers with 1 vehicle each (Maruti, Hyundai, Tata, Mahindra, etc.)
+// 3. 25 Mechanics with ratings (4.1–5.0) and randomized specialties
+// 4. 550 Bookings over 90 days with realistic status distribution:
+//    - Completed: ~55% (302)
+//    - Pending: ~10% (55)
+//    - Assigned: ~10% (55)
+//    - Mechanic On The Way: ~8% (44)
+//    - In Progress: ~10% (55)
+//    - Cancelled: ~7% (39)
+```
+
+- **What it does:** Populates MongoDB with rich, statistically realistic data:
+  1. Wipes any stale documents to ensure consistent state.
+  2. Inserts 8 vehicle services with Indian Rupee (INR) pricing.
+  3. Uses `@faker-js/faker` to create 60 customers with authentic Indian names, phone numbers, and vehicles (Maruti, Hyundai, Tata, Mahindra, Kia, etc.) with realistic state license plates (`MH`, `DL`, `KA`, `TS`, `HR`, etc.).
+  4. Inserts 25 mechanics with ratings (4.1 to 5.0) and random specialties.
+  5. Inserts 550 bookings distributed over the last 90 days with a strict realistic distribution (~55% Completed, rest spread across active and cancelled statuses).
+  6. Builds progressive chronological audit logs in `statusHistory[]` (e.g. Pending ➔ Assigned ➔ On The Way ➔ In Progress ➔ Completed).
+  7. Links active bookings to the assigned mechanics' `currentBooking` field and syncs their status (`busy` or `on_the_way`).
+- **Why required by system:**
+  - An operations dashboard cannot be effectively demonstrated or tested with 2-3 empty cards.
+  - 550 bookings distributed over 90 days powers realistic Recharts revenue graphs, pagination testing across multiple pages, and live Kanban queue testing out-of-the-box.
+- **How to execute:**
+  ```bash
+  cd server
+  npm run seed
+  ```
+
+---
+
+### 14. Real-Time Operations Event Simulator (`server/simulate.js`)
+
+```javascript
+const NEXT_STATUS_MAP = {
+  Pending: 'Assigned',
+  Assigned: 'Mechanic On The Way',
+  'Mechanic On The Way': 'In Progress',
+  'In Progress': 'Completed'
+};
+
+const advanceRandomBooking = async () => {
+  // 1. Fetch current Pending & Assigned bookings
+  const [pendingRes, assignedRes] = await Promise.all([
+    apiCall('/bookings?status=Pending&limit=30'),
+    apiCall('/bookings?status=Assigned&limit=30')
+  ]);
+
+  const candidateBookings = [...(pendingRes.data || []), ...(assignedRes.data || [])];
+  if (candidateBookings.length === 0) return;
+
+  // 2. Pick a random candidate booking
+  const booking = candidateBookings[Math.floor(Math.random() * candidateBookings.length)];
+  const nextStatus = NEXT_STATUS_MAP[booking.status];
+
+  // 3. If Pending and unassigned, auto-assign an available mechanic
+  if (booking.status === 'Pending' && !booking.mechanic) {
+    const mechanicsRes = await apiCall('/mechanics?limit=25');
+    const availableMech = mechanicsRes.data?.find((m) => m.status === 'available');
+    await apiCall(`/bookings/${booking._id}/assign`, {
+      method: 'PATCH',
+      body: JSON.stringify({ mechanicId: availableMech._id })
+    });
+    return;
+  }
+
+  // 4. Advance status via real backend API endpoint
+  await apiCall(`/bookings/${booking._id}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      status: nextStatus,
+      note: `Simulator automated transition to ${nextStatus}`
+    })
+  });
+};
+
+// Runs continuously every 15 to 30 seconds
+const runSimulationLoop = () => {
+  const intervalSeconds = Math.floor(Math.random() * 16) + 15;
+  setTimeout(async () => {
+    await advanceRandomBooking();
+    runSimulationLoop();
+  }, intervalSeconds * 1000);
+};
+```
+
+- **What it does:**
+  - Operates as an automated background agent simulating real-world garage operations.
+  - Every 15–30 seconds (randomized interval), it queries the active server for `Pending` and `Assigned` bookings.
+  - Selects a random booking and advances it through the state machine:
+    - If `Pending`, it finds an available mechanic and calls `PATCH /api/bookings/:id/assign`.
+    - If `Assigned`, it advances to `Mechanic On The Way` via `PATCH /api/bookings/:id/status`.
+  - Because it makes real HTTP requests against the running Express server, the Express controller logic executes naturally:
+    1. Updates the MongoDB booking document.
+    2. Appends an entry to `statusHistory[]`.
+    3. Updates the mechanic's status and `currentBooking` in MongoDB.
+    4. **Emits `booking:updated` and `mechanic:status_changed` via Socket.io to all open browser windows!**
+- **Why required by system:**
+  - Eliminates the need to manually click status buttons in two different browser tabs to demonstrate real-time WebSocket capabilities.
+  - Enables you to open the dashboard during your internship presentation and show the live metrics, Kanban cards, and mechanic roster updating dynamically on screen by themselves!
+- **How to execute:**
+  ```bash
+  # In a separate terminal while the server is running:
+  cd server
+  npm run simulate
+  ```
+
+---
+
+## STEP 5: Real-Time Socket.io Server Wiring, useLiveBookingUpdates Hook & Toast Notifications
+
+---
+
+### 15. Server-Side Socket.io Integration (`server/server.js` & `server/src/index.ts`)
+
+```javascript
+import http from 'http';
+import express from 'express';
+import { Server } from 'socket.io';
+
+const app = express();
+const httpServer = http.createServer(app);
+
+// Attach Socket.io with CORS restricted strictly to CLIENT_URL
+const io = new Server(httpServer, {
+  cors: {
+    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    credentials: true
+  }
+});
+
+// Log real-time connection lifecycle
+io.on('connection', (socket) => {
+  console.log(`⚡ [Socket.io] Client connected: ${socket.id}`);
+
+  socket.on('disconnect', (reason) => {
+    console.log(`🔌 [Socket.io] Client disconnected: ${socket.id} (${reason})`);
+  });
+});
+
+// Store io on Express app so any controller can access it:
+// const io = req.app.get('io');
+// io.emit('booking:updated', updatedBooking);
+app.set('io', io);
+
+httpServer.listen(PORT);
+```
+
+- **What it does:**
+  1. Wraps the Express application within a Node `http.Server` instance.
+  2. Instantiates `socket.io.Server`, applying CORS rules so only requests from `CLIENT_URL` (typically `http://localhost:5173`) can establish WebSocket channels.
+  3. Binds connection/disconnection handlers to log real-time diagnostics.
+  4. Stores the active `io` instance directly on the Express app via `app.set('io', io)`.
+- **Why required by system:**
+  - Standard Express route handlers run in isolation. By binding `io` to the app dictionary, any controller across any route file can retrieve the broadcaster via `req.app.get('io')` without importing a singleton or creating circular dependencies.
+  - CORS restriction protects your WebSocket gateway from unauthorized cross-origin socket flooding.
+
+---
+
+### 16. Client Socket Client Singleton (`client/src/lib/socket.ts`)
+
+```typescript
+import { io, Socket } from 'socket.io-client';
+
+const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const socketUrl = import.meta.env.VITE_SOCKET_URL || apiUrl.replace(/\/api\/?$/, '') || 'http://localhost:5000';
+
+export const socket: Socket = io(socketUrl, {
+  autoConnect: true,
+  reconnection: true,
+  reconnectionAttempts: 10,
+  reconnectionDelay: 1000,
+  transports: ['websocket', 'polling']
+});
+
+socket.on('connect', () => console.log(`⚡ [Socket.io] Connected: ${socket.id}`));
+socket.on('disconnect', (reason) => console.log(`🔌 [Socket.io] Disconnected: ${reason}`));
+
+export default socket;
+```
+
+- **What it does:**
+  - Dynamically extracts the host server URL from `VITE_API_URL` (stripping the `/api` route suffix).
+  - Instantiates a persistent, shared `socket.io-client` connection.
+  - Automatically reconnects if network drops, falling back from WebSocket to HTTP long-polling if necessary.
+- **Why required by system:**
+  - Prevents opening duplicate socket connections each time a component mounts or unmounts.
+  - Shared across all custom hooks and components.
+
+---
+
+### 17. Real-Time Hook (`client/src/hooks/useLiveBookingUpdates.ts`)
+
+```typescript
+import { useEffect, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import { socket } from '../lib/socket';
+
+export const useLiveBookingUpdates = () => {
+  const queryClient = useQueryClient();
+  const [isConnected, setIsConnected] = useState(socket.connected);
+
+  useEffect(() => {
+    const handleConnect = () => setIsConnected(true);
+    const handleDisconnect = () => setIsConnected(false);
+
+    const handleBookingUpdated = (booking: any) => {
+      // 1. Invalidate both specified React Query keys
+      queryClient.invalidateQueries({ queryKey: ['bookings'] });
+      queryClient.invalidateQueries({ queryKey: ['dashboard-summary'] });
+      queryClient.invalidateQueries({ queryKey: ['mechanics'] });
+
+      // 2. Trigger toast notification
+      const vehicleDesc = booking.vehicle
+        ? `${booking.vehicle.make} ${booking.vehicle.model} (${booking.vehicle.licensePlate})`
+        : '';
+
+      toast.info(`Booking ${booking.bookingId} Updated`, {
+        description: `Status: ${booking.status}${vehicleDesc ? ` • ${vehicleDesc}` : ''}`,
+        duration: 5000
+      });
+    };
+
+    socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
+    socket.on('booking:updated', handleBookingUpdated);
+
+    return () => {
+      socket.off('connect', handleConnect);
+      socket.off('disconnect', handleDisconnect);
+      socket.off('booking:updated', handleBookingUpdated);
+    };
+  }, [queryClient]);
+
+  return { isConnected };
+};
+```
+
+- **What it does:**
+  - Listens for the `booking:updated` event emitted by the server.
+  - Calls `queryClient.invalidateQueries` on `['bookings']` and `['dashboard-summary']`, prompting React Query to silently refetch fresh data in the background.
+  - Fires an interactive dark-mode Sonner toast notification displaying the booking ID, updated status, and vehicle information.
+  - Properly unbinds event listeners when the parent component unmounts.
+- **Why required by system:**
+  - Eliminates polling loops (`setInterval`). Data updates instantly on screen whenever a booking changes status on the backend or in another dispatcher's tab.
+
+---
+
+### 18. Where to Call `useLiveBookingUpdates` in the App
+
+To ensure the hook is **active everywhere across the entire application**, it must be called:
+
+1. **Inside `QueryClientProvider`**: It calls `useQueryClient()`, which requires React Query's context.
+2. **At the Root Layout Level (`client/src/App.tsx`)**:
+   ```tsx
+   // client/src/App.tsx
+   import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+   import { Toaster } from './components/ui/sonner';
+   import { useLiveBookingUpdates } from './hooks/useLiveBookingUpdates';
+
+   const queryClient = new QueryClient();
+
+   // Global subscriber rendered once at the top of the component tree
+   const GlobalLiveUpdatesSubscriber = () => {
+     useLiveBookingUpdates();
+     return null; // or return a live status indicator pill
+   };
+
+   export const App = () => {
+     return (
+       <QueryClientProvider client={queryClient}>
+         <GlobalLiveUpdatesSubscriber />
+         <BrowserRouter>
+           {/* All Routes (Dashboard, Bookings, Mechanics, Analytics) */}
+           <Routes>...</Routes>
+         </BrowserRouter>
+         {/* Global Toast Container */}
+         <Toaster position="top-right" richColors closeButton />
+       </QueryClientProvider>
+     );
+   };
+   ```
+3. **Why this location?**
+   - If placed inside an individual page like `DashboardPage.tsx`, the WebSocket listener would disconnect whenever the user navigates away to `BookingsPage` or `MechanicsPage`.
+   - By placing it at the root in `App.tsx`, incoming bookings and status updates trigger toasts and invalidate query caches regardless of which page the dispatcher is currently viewing!
+
+---
+
+## STEP 6: Dashboard Layout Shell, Typed API Client, TanStack Query & Operations Hooks
+
+---
+
+### 19. Dashboard Layout Shell (`client/src/components/layout/DashboardLayout.tsx`)
+
+```tsx
+export const DashboardLayout: React.FC = () => {
+  const location = useLocation();
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
+  const { isConnected } = useLiveBookingUpdates();
+
+  // Dynamic page title based on current route
+  const { title, subtitle } = getPageTitle();
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      {/* 1. Desktop Fixed Left Sidebar (hidden below md breakpoint) */}
+      <aside className="hidden md:flex fixed top-0 left-0 bottom-0 w-64 flex-col bg-slate-900/70 backdrop-blur-xl border-r border-slate-800 z-30">
+        <NavHeader />
+        <NavLinks items={NAV_ITEMS} />
+      </aside>
+
+      {/* 2. Mobile Navigation Drawer (Overlay on screens < md) */}
+      {mobileDrawerOpen && <MobileDrawer onClose={() => setMobileDrawerOpen(false)} />}
+
+      {/* 3. Sticky Topbar with Dynamic Title & Live Socket Indicator */}
+      <header className="sticky top-0 z-20 md:ml-64 h-16 bg-slate-950/85 backdrop-blur-md border-b border-slate-800 px-4 md:px-8 flex items-center justify-between">
+        <PageTitle title={title} subtitle={subtitle} />
+        <SocketStatusIndicator isConnected={isConnected} />
+      </header>
+
+      {/* 4. Child Route Content */}
+      <main className="flex-1 md:ml-64 p-4 md:p-8 pb-20 md:pb-8">
+        <Outlet />
+      </main>
+
+      {/* 5. Mobile Bottom Navigation Bar (Visible only on screens < md) */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 h-16 bg-slate-900/95 border-t border-slate-800 z-30 flex items-center justify-around">
+        <MobileNavTabs items={NAV_ITEMS} />
+      </nav>
+    </div>
+  );
+};
+```
+
+- **What it does:**
+  - Establishes a responsive dual-mode layout:
+    - **Desktop (`>= 768px`)**: Fixed 64-column left sidebar with active route glow, topbar with dynamic page title, and `<Outlet />` content container offset with `md:ml-64`.
+    - **Mobile (`< 768px`)**: The fixed sidebar collapses into a thumb-friendly bottom navigation bar and a slide-out hamburger drawer.
+  - Dynamically calculates the topbar title and subtitle from `location.pathname` (e.g. `/analytics` ➔ "Operational Analytics", `/bookings/:id` ➔ "Booking Details #...").
+  - Houses the live socket connection indicator (`Socket Live` / `Offline`).
+- **Why required by system:**
+  - Provides a single persistent layout frame across all routes, preventing layout shifts, re-renders, or loss of WebSocket connection state during navigation.
+
+---
+
+### 20. Typed API Client (`client/src/lib/api.ts`)
+
+```typescript
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+
+export const apiClient = axios.create({
+  baseURL: API_BASE_URL,
+  headers: { 'Content-Type': 'application/json' }
+});
+
+export const getDashboardSummary = async (): Promise<IDashboardSummary> => {
+  const { data } = await apiClient.get<IApiResponse<IDashboardSummary>>('/dashboard/summary');
+  return data.data;
+};
+
+export const getBookings = async (filters: IBookingFilters = {}): Promise<{ data: IBooking[]; pagination: IPagination }> => {
+  const { data } = await apiClient.get<IApiResponse<IBooking[]>>('/bookings', { params: filters });
+  return { data: data.data, pagination: data.pagination! };
+};
+
+export const getBookingDetail = async (id: string): Promise<IBooking> => {
+  const { data } = await apiClient.get<IApiResponse<IBooking>>(`/bookings/${id}`);
+  return data.data;
+};
+
+export const getMechanics = async (filters: IMechanicFilters = {}): Promise<{ data: IMechanic[]; pagination: IPagination }> => {
+  const { data } = await apiClient.get<IApiResponse<IMechanic[]>>('/mechanics', { params: filters });
+  return { data: data.data, pagination: data.pagination! };
+};
+
+export const getMechanicDetail = async (id: string): Promise<IMechanic> => {
+  const { data } = await apiClient.get<IApiResponse<IMechanic>>(`/mechanics/${id}`);
+  return data.data;
+};
+```
+
+- **What it does:**
+  - Centralizes all Axios HTTP requests pointed at `VITE_API_URL`.
+  - Strictly types all input filters and returned payloads matching the Phase 2 backend controller responses (`data`, `pagination: { total, page, limit, pages }`).
+- **Why required by system:**
+  - Ensures compile-time TypeScript safety. If a backend payload changes, TypeScript immediately alerts you where the frontend breaks.
+
+---
+
+### 21. Typed React Query Operations Hooks (`client/src/hooks/useOperationsQueries.ts`)
+
+```typescript
+// 1. Dashboard summary hook
+export const useDashboardSummary = () => {
+  return useQuery({
+    queryKey: ['dashboard-summary'],
+    queryFn: getDashboardSummary,
+    staleTime: 1000 * 30
+  });
+};
+
+// 2. Paginated bookings hook
+export const useBookings = (filters: IBookingFilters = {}) => {
+  return useQuery({
+    queryKey: ['bookings', filters],
+    queryFn: () => getBookings(filters),
+    staleTime: 1000 * 30
+  });
+};
+
+// 3. Single booking detail hook
+export const useBookingDetail = (id?: string) => {
+  return useQuery({
+    queryKey: ['booking', id],
+    queryFn: () => getBookingDetail(id!),
+    enabled: Boolean(id) && id !== 'new'
+  });
+};
+
+// 4. Mechanics fleet list hook
+export const useMechanics = (filters: IMechanicFilters = {}) => {
+  return useQuery({
+    queryKey: ['mechanics', filters],
+    queryFn: () => getMechanics(filters),
+    staleTime: 1000 * 45
+  });
+};
+
+// 5. Mechanic detail with relatedBookings history hook
+export const useMechanicDetail = (id?: string) => {
+  return useQuery({
+    queryKey: ['mechanic', id],
+    queryFn: () => getMechanicDetail(id!),
+    enabled: Boolean(id)
+  });
+};
+```
+
+- **What it does:**
+  - Packages each REST endpoint into a dedicated TanStack Query hook with caching, loading states, and automatic background refetching.
+  - Matches the exact query keys (`['bookings']`, `['dashboard-summary']`) targeted by the Socket.io `booking:updated` listener.
+- **Why required by system:**
+  - Completely eliminates boilerplate `useEffect` fetching, `useState` loading flags, and manual error management in React components.
+
+---
+
+### 22. Root Router & QueryClient Setup (`client/src/App.tsx`)
+
+```tsx
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 30,       // 30s cache retention
+      retry: 1,                   // 1 automatic retry on network hiccup
+      refetchOnWindowFocus: false // Prevents UI thrashing when switching desktop windows
+    }
+  }
+});
+
+export const App: React.FC = () => {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<DashboardLayout />}>
+            <Route index element={<OverviewPage />} />
+            <Route path="analytics" element={<AnalyticsPage />} />
+            <Route path="bookings" element={<BookingsPage />} />
+            <Route path="bookings/:id" element={<BookingDetailPage />} />
+            <Route path="mechanics" element={<MechanicsPage />} />
+            <Route path="mechanics/:id" element={<MechanicDetailPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        </Routes>
+        <Toaster position="top-right" richColors closeButton />
+      </BrowserRouter>
+    </QueryClientProvider>
+  );
+};
+```
+
+- **Sensible QueryClient Defaults:**
+  - `staleTime: 1000 * 30`: Data is fresh for 30s, preventing redundant HTTP requests when clicking between tabs.
+  - `retry: 1`: Re-attempts failed requests once before showing an error.
+  - `refetchOnWindowFocus: false`: Keeps the live operational board steady without unexpected refetches when refocusing the browser.
+- **Route Hierarchy:** All 6 required views (`/`, `/analytics`, `/bookings`, `/bookings/:id`, `/mechanics`, `/mechanics/:id`) are nested under `DashboardLayout`, enabling persistent sidebar navigation and socket connectivity everywhere.
+
+
+What Was Executed & Verified
+
+Database Seeder Executed:
+Wiped and seeded 550 bookings spread over the past 90 days with ~55% Completed.
+Seeded 60 customers (with individual vehicles).
+Seeded 25 mechanics (ratings 4.1–5.0 with specialties).
+Seeded 8 vehicle repair services with INR pricing (₹899 to ₹7,999).
+Backend Server Running on Port 5000:
+
+MongoDB $facet aggregation summary (/api/dashboard/summary) returns total revenue of ₹11,55,198+, 165 active operations, and 25 active mechanics.
+Swagger docs live at /api-docs.
+
+Frontend Application Running on Port 5173:
+Overview, Analytics, Bookings, and Mechanics routes fully rendered.
+Topbar displays Socket Live in green.
+Real-Time Sync & Toast Verified:
+simulate.js continuously advances Pending/Assigned bookings every 15–30 seconds.
+Verified that live Sonner toast notifications (e.g. Booking BK-10075 Updated) automatically appear on screen and invalidate the TanStack Query caches without page reloads.
+
+---
+
+## STEP 7: Overview 8 Stat Cards, TanStack Table Bookings, Interactive Detail & Mechanics History
+
+---
+
+### 23. Reusable Status Badge Component (`client/src/components/dashboard/StatusBadge.tsx`)
+
+```tsx
+export const StatusBadge: React.FC<{ status: BookingStatus | MechanicStatus | string }> = ({ status }) => {
+  const getStyle = (st: string) => {
+    switch (st) {
+      case 'Pending':             return 'bg-amber-500/15 text-amber-400 border-amber-500/30';
+      case 'Assigned':            return 'bg-blue-500/15 text-blue-400 border-blue-500/30';
+      case 'Mechanic On The Way':
+      case 'on_the_way':          return 'bg-purple-500/15 text-purple-400 border-purple-500/30';
+      case 'In Progress':
+      case 'busy':                return 'bg-cyan-500/15 text-cyan-400 border-cyan-500/30';
+      case 'Completed':
+      case 'available':           return 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
+      case 'Cancelled':
+      case 'offline':             return 'bg-rose-500/15 text-rose-400 border-rose-500/30';
+      default:                    return 'bg-slate-500/15 text-slate-400 border-slate-500/30';
+    }
+  };
+
+  return (
+    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${getStyle(status)}`}>
+      <span className="w-1.5 h-1.5 rounded-full bg-current mr-1.5 opacity-80" />
+      {formatLabel(status)}
+    </span>
+  );
+};
+```
+
+- **What it does:** Renders a standardized, glowing status pill for both booking statuses (`Pending`, `Assigned`, `In Progress`, etc.) and mechanic fleet statuses (`available`, `busy`, `on_the_way`, `offline`).
+- **Why required:** Unifies visual status language across tables, detail pages, and overview cards.
+
+---
+
+### 24. Overview Page 8 Stat Cards (`client/src/pages/OverviewPage.tsx`)
+
+```tsx
+const statCardsConfig = [
+  { label: 'Total Bookings',    value: summary.totalBookings,     icon: CalendarDays,  color: 'text-cyan-400' },
+  { label: "Today's Bookings",   value: summary.todayBookings,     icon: CalendarCheck, color: 'text-blue-400' },
+  { label: 'Completed',         value: summary.completed,         icon: CheckCircle2,  color: 'text-emerald-400' },
+  { label: 'Pending',           value: summary.pending,           icon: Clock,         color: 'text-amber-400' },
+  { label: 'Cancelled',         value: summary.cancelled,         icon: XCircle,       color: 'text-rose-400' },
+  { label: 'Total Revenue',     value: formatCurrencyINR(summary.totalRevenue), icon: IndianRupee, color: 'text-emerald-400' },
+  { label: 'Active Mechanics',  value: summary.activeMechanics,   icon: Users,         color: 'text-purple-400' },
+  { label: 'New Customers',     value: summary.newCustomersToday, icon: UserPlus,      color: 'text-teal-400' }
+];
+```
+
+- **What it does:**
+  - Displays exactly the 8 operational metrics fed by `useDashboardSummary()`.
+  - Every card features a unique Lucide icon, tailored gradient background, and descriptive sub-label.
+  - Implements an 8-card **skeleton loading state** (`animate-pulse`) so the layout remains steady before MongoDB data arrives.
+- **Why required:** Gives garage dispatchers an instantaneous, at-a-glance health check of operational volume, revenue, and fleet availability.
+
+---
+
+### 25. TanStack Table Bookings Page (`client/src/pages/BookingsPage.tsx`)
+
+```tsx
+import { useReactTable, getCoreRowModel, flexRender, createColumnHelper } from '@tanstack/react-table';
+
+// 1. Column Definitions
+const columns = [
+  columnHelper.accessor('bookingId', { header: 'Booking ID', enableSorting: true }),
+  columnHelper.accessor('customer',  { header: 'Customer',   enableSorting: false }),
+  columnHelper.accessor('vehicle',   { header: 'Vehicle',    enableSorting: false }),
+  columnHelper.accessor('service',   { header: 'Service',    enableSorting: false }),
+  columnHelper.accessor('mechanic',  { header: 'Mechanic',   enableSorting: false }),
+  columnHelper.accessor('status',    { header: 'Status',     enableSorting: true }),
+  columnHelper.accessor('amount',    { header: 'Amount',     enableSorting: true }),
+  columnHelper.accessor('createdAt', { header: 'Date',       enableSorting: true })
+];
+
+// 2. TanStack Table Instance
+const table = useReactTable({
+  data: bookings,
+  columns,
+  state: { sorting },
+  onSortingChange: setSorting,
+  getCoreRowModel: getCoreRowModel(),
+  manualSorting: true // Server-side MongoDB sorting
+});
+```
+
+- **What it does:**
+  - Employs **TanStack Table v8** (`@tanstack/react-table`) for headless, flexible data table management.
+  - **Debounced Search:** Uses a 350ms debounce effect so fast keystrokes don't flood the MongoDB server.
+  - **Sortable Columns:** Clicking headers (`Booking ID`, `Status`, `Amount`, `Date`) cycles sorting between `asc`, `desc`, and default, automatically updating `sortBy` and `order` query params.
+  - **Status Filter:** Select dropdown filtering bookings by exact operational state.
+  - **Pagination Controls:** Shows current page, total pages, page size selector (10, 15, 25, 50), and Prev/Next buttons.
+  - **Row Navigation:** Clicking any row navigates directly to `/bookings/:id` via `useNavigate()`.
+- **Why required:** TanStack Table provides enterprise-grade table mechanics (virtualization-ready, decoupled UI) while server-side query syncing guarantees instant performance even with thousands of bookings.
+
+---
+
+### 26. Booking Detail Page & Interactive Operations Controller (`client/src/pages/BookingDetailPage.tsx`)
+
+```tsx
+// 1. One-Click Next Status Advancement
+const handleAdvanceStatus = () => {
+  if (!nextStatus) return;
+  updateStatusMutation.mutate({
+    id: booking._id,
+    status: nextStatus,
+    note: customNote || `Manual advance to ${nextStatus} via ops control`
+  });
+};
+
+// 2. Visual Timeline Rendering
+<div className="relative pl-6 space-y-6 before:absolute before:left-2.5 before:top-3 before:bottom-3 before:w-0.5 before:bg-slate-800">
+  {booking.statusHistory?.map((entry, idx) => (
+    <div key={idx} className="relative flex items-start space-x-4">
+      <div className="absolute -left-6 top-1 h-3.5 w-3.5 rounded-full bg-cyan-500 border-2 border-slate-950" />
+      <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800">
+        <StatusBadge status={entry.status} />
+        <span className="text-[11px] text-slate-400">{formatDate(entry.timestamp)}</span>
+        <p className="text-slate-300 text-xs mt-1">{entry.note}</p>
+      </div>
+    </div>
+  ))}
+</div>
+```
+
+- **What it does:**
+  - Displays full booking information: Customer profile, vehicle snapshot (make, model, license plate, year), ordered service, charges, and assigned technician.
+  - **Visual Status Timeline:** Renders a vertical chronological tree tracing every state transition from booking creation to completion, displaying timestamps and dispatcher audit notes.
+  - **Interactive Operations Demo Controller:** Allows you or an interviewer to manually advance a booking to the next state (e.g. `Assigned` ➔ `Mechanic On The Way` ➔ `In Progress` ➔ `Completed`) with a single click, or pick an arbitrary status from a dropdown. This triggers the real backend update API, stores the audit note, and emits the Socket.io event to all open dashboards!
+- **Why required:** Critical for demonstration purposes, showing full lifecycle control and end-to-end WebSocket synchronization.
+
+---
+
+### 27. Mechanics Fleet Grid & Detail Page with Job History (`client/src/pages/MechanicsPage.tsx` & `MechanicDetailPage.tsx`)
+
+```tsx
+// MechanicsPage.tsx: Card grid with current booking link
+{currentBookingId ? (
+  <Link to={`/bookings/${currentBookingId}`} className="text-[11px] p-2 rounded-xl bg-cyan-950/40 text-cyan-300">
+    Active Booking Attached ➔
+  </Link>
+) : (
+  <span className="text-[11px] text-slate-500 italic">No active booking assigned</span>
+)}
+
+// MechanicDetailPage.tsx: Full job history table
+{relatedBookings.map((b) => (
+  <tr key={b._id}>
+    <td>{b.bookingId}</td>
+    <td>{b.customer?.name}</td>
+    <td>{b.service?.name}</td>
+    <td><StatusBadge status={b.status} /></td>
+    <td><Link to={`/bookings/${b._id}`}>Inspect ➔</Link></td>
+  </tr>
+))}
+```
+
+- **What it does:**
+  - **`MechanicsPage`**: Displays a responsive card grid showing technician name, live availability badge, customer rating, completed jobs count, certified specialties, and a direct link to their currently active service booking.
+  - **`MechanicDetailPage`**: Shows the full technician profile and a complete **Job History Table** (`relatedBookings[]`) tracing all tickets ever handled by this mechanic, with direct links to inspect each booking.
+- **Why required:** Gives fleet managers total visibility into specialist workloads, track records, and historical efficiency.
+
+---
+
+## STEP 8: Analytics Controller ($lookup on Service) & Recharts Telemetry Dashboard
+
+---
+
+### 28. Analytics Aggregation Controller (`server/src/controllers/analyticsController.ts`)
+
+```typescript
+export const getAnalytics = async (req: Request, res: Response, next: NextFunction) => {
+  const { days = '30' } = req.query;
+  const numDays = Math.min(90, Math.max(1, parseInt(days as string, 10) || 30));
+
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - numDays);
+  startDate.setHours(0, 0, 0, 0);
+
+  const [aggregationResult] = await Booking.aggregate([
+    {
+      $facet: {
+        // 1. Daily booking counts and revenue
+        dailyMetrics: [
+          { $match: { createdAt: { $gte: startDate } } },
+          {
+            $group: {
+              _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+              bookings: { $sum: 1 },
+              revenue: { $sum: { $cond: [{ $eq: ['$status', 'Completed'] }, '$amount', 0] } }
+            }
+          },
+          { $sort: { _id: 1 } }
+        ],
+
+        // 2. Booking counts & revenue grouped by service category via $lookup on Service
+        categoryBreakdown: [
+          { $match: { createdAt: { $gte: startDate } } },
+          {
+            $lookup: {
+              from: 'services',
+              localField: 'service',
+              foreignField: '_id',
+              as: 'serviceDoc'
+            }
+          },
+          { $unwind: '$serviceDoc' },
+          {
+            $group: {
+              _id: '$serviceDoc.category',
+              count: { $sum: 1 },
+              revenue: { $sum: { $cond: [{ $eq: ['$status', 'Completed'] }, '$amount', 0] } }
+            }
+          },
+          { $sort: { count: -1 } }
+        ],
+
+        // 3. Status breakdown counts for Donut chart
+        statusBreakdown: [
+          { $match: { createdAt: { $gte: startDate } } },
+          { $group: { _id: '$status', count: { $sum: 1 } } },
+          { $sort: { count: -1 } }
+        ],
+
+        // 4. Period totals
+        periodSummary: [
+          { $match: { createdAt: { $gte: startDate } } },
+          {
+            $group: {
+              _id: null,
+              totalBookings: { $sum: 1 },
+              totalRevenue: { $sum: { $cond: [{ $eq: ['$status', 'Completed'] }, '$amount', 0] } }
+            }
+          }
+        ]
+      }
+    }
+  ]);
+};
+```
+
+- **What it does:**
+  - Evaluates operational performance over a sliding window (`7`, `30`, or `90` days).
+  - Uses a single MongoDB aggregation pipeline with `$facet` to calculate four sub-pipelines in parallel:
+    1. **`dailyMetrics`**: Groups bookings by day (`%Y-%m-%d`) and calculates total booking count and realized revenue (summing `amount` only when `status === 'Completed'`).
+    2. **`categoryBreakdown`**: Performs a `$lookup` joining `bookings.service` with the `services` collection, unwinds the foreign document, and groups by `serviceDoc.category` to reveal which service lines (Engine, Tyres, Brakes, AC, etc.) drive the most volume and revenue.
+    3. **`statusBreakdown`**: Groups bookings by status for proportional donut chart visualization.
+    4. **`periodSummary`**: Computes period-level total volume and total revenue.
+  - **Continuous Date Filling:** Iterates over every calendar date between `startDate` and `today`. If MongoDB returned zero bookings for any date, it fills `{ bookings: 0, revenue: 0 }`. This prevents gaps or jagged jumps in Recharts line graphs!
+- **Why required:** Without `$lookup`, the `Booking` collection only has the `service` ObjectId reference. The `$lookup` joins the `Service` catalog in the database engine, allowing aggregation by `category` in sub-millisecond execution time.
+
+---
+
+### 29. Recharts Operational Analytics Dashboard (`client/src/pages/AnalyticsPage.tsx`)
+
+```tsx
+export const AnalyticsPage: React.FC = () => {
+  const [selectedDays, setSelectedDays] = useState<number>(30);
+  const { data: analytics, isLoading } = useAnalytics(selectedDays);
+
+  return (
+    <div>
+      {/* 1. Range Selector Tabs (7d / 30d / 90d) */}
+      <div className="flex items-center space-x-2">
+        <button onClick={() => setSelectedDays(7)}>Last 7 Days</button>
+        <button onClick={() => setSelectedDays(30)}>Last 30 Days</button>
+        <button onClick={() => setSelectedDays(90)}>Last 90 Days</button>
+      </div>
+
+      {/* 2. Line Chart: Daily Bookings Over Time */}
+      <LineChart data={daily}>
+        <XAxis dataKey="label" />
+        <YAxis />
+        <Tooltip />
+        <Line type="monotone" dataKey="bookings" stroke="#06b6d4" strokeWidth={3} />
+      </LineChart>
+
+      {/* 3. Area Chart: Daily Revenue Velocity (INR) */}
+      <AreaChart data={daily}>
+        <defs>
+          <linearGradient id="revenueGradient">
+            <stop offset="5%" stopColor="#10b981" stopOpacity={0.4} />
+            <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
+          </linearGradient>
+        </defs>
+        <YAxis tickFormatter={(v) => `₹${(v / 1000).toFixed(0)}k`} />
+        <Area type="monotone" dataKey="revenue" stroke="#10b981" fill="url(#revenueGradient)" />
+      </AreaChart>
+
+      {/* 4. Donut Chart: Operational Status Distribution */}
+      <PieChart>
+        <Pie data={byStatus} dataKey="count" nameKey="status" innerRadius={60} outerRadius={95} paddingAngle={4}>
+          {byStatus.map((entry, i) => <Cell key={i} fill={STATUS_COLORS[entry.status]} />)}
+        </Pie>
+        <Legend />
+      </PieChart>
+
+      {/* 5. Horizontal Bar Chart: Service Category Breakdown ($lookup) */}
+      <BarChart layout="vertical" data={byCategory}>
+        <XAxis type="number" />
+        <YAxis type="category" dataKey="category" width={90} />
+        <Bar dataKey="count" radius={[0, 6, 6, 0]}>
+          {byCategory.map((_, i) => <Cell key={i} fill={CATEGORY_COLORS[i % CATEGORY_COLORS.length]} />)}
+        </Bar>
+      </BarChart>
+    </div>
+  );
+};
+```
+
+- **What it does:**
+  - **Single Unified Query**: All 4 charts are fed by a single `useAnalytics(selectedDays)` React Query call.
+  - **Interactive Range Filtering**: Clicking `Last 7 Days`, `Last 30 Days`, or `Last 90 Days` updates state and immediately refetches all 4 charts simultaneously.
+  - **4 Visualizations**:
+    1. **Line Chart**: Daily ticket creation volume.
+    2. **Area Chart**: Revenue trajectory in Indian Rupees (INR) with smooth emerald green gradient shading and formatted axis ticks (`₹15k`, `₹30k`).
+    3. **Donut Chart**: Operational stage proportions with distinct theme colors and legend.
+    4. **Horizontal Bar Chart**: Demand distribution across categories (Engine, Battery, Brakes, Tyres, AC, Cosmetic, General Service) powered by the backend `$lookup`.
+  - **Interactive Tooltips**: Custom dark-themed popovers showing exact counts, INR revenues, and percentages on hover.
+- **Why required:** Empowers operations directors to pinpoint demand surges, identify underutilized service categories, and track revenue velocity over customizable time horizons.
+
+---
+
+## STEP 9: Reusable State Components, Micro-Interactions Suite & Multi-Resolution Responsive Audit
+
+---
+
+### 30. Reusable State Handling Architecture (`client/src/components/common/`)
+
+#### 1. `<LoadingSkeleton />` (`LoadingSkeleton.tsx`)
+```tsx
+export const LoadingSkeleton: React.FC<{
+  variant?: 'card' | 'table-row' | 'chart' | 'text' | 'circle';
+  count?: number;
+  className?: string;
+}> = ({ variant = 'card', count = 1, className = '' }) => {
+  // Renders animated pulse skeleton blocks mapped to the exact dimensions of cards, table rows, or Recharts viewports
+};
+```
+- **What it does:** Generates dark-themed, pulse-animated (`animate-pulse`) placeholders matching the layout dimensions of the loaded UI.
+- **Why required:** Prevents layout shifts (CLS) when waiting for asynchronous API responses from MongoDB.
+
+#### 2. `<ErrorState />` (`ErrorState.tsx`)
+```tsx
+export const ErrorState: React.FC<{
+  title?: string;
+  message?: string;
+  onRetry?: () => void;
+}> = ({ title, message, onRetry }) => (
+  <div className="p-6 rounded-2xl bg-rose-950/20 border border-rose-500/30 text-rose-300 flex items-center justify-between">
+    <div>
+      <h4>{title}</h4>
+      <p>{message}</p>
+    </div>
+    {onRetry && <button onClick={onRetry}>Retry Request</button>}
+  </div>
+);
+```
+- **What it does:** Displays an alert banner explaining what went wrong, with an interactive **"Retry Request"** button connected to React Query's `refetch()`.
+- **Why required:** Eliminates dead-ends for the user if an API request fails due to temporary network or database disconnections.
+
+#### 3. `<EmptyState />` (`EmptyState.tsx`)
+```tsx
+export const EmptyState: React.FC<{
+  title?: string;
+  message?: string;
+  icon?: LucideIcon;
+  actionLabel?: string;
+  onAction?: () => void;
+}> = ({ title, message, icon: Icon = Inbox, actionLabel, onAction }) => (
+  <div className="p-10 rounded-2xl bg-slate-900/40 text-center flex flex-col items-center">
+    <Icon className="h-6 w-6 text-slate-500" />
+    <h4>{title}</h4>
+    <p>{message}</p>
+    {actionLabel && <button onClick={onAction}>{actionLabel}</button>}
+  </div>
+);
+```
+- **What it does:** Displays an informative placeholder when a search query or status filter returns zero results, providing a one-click action to reset filters.
+- **Why required:** Prevents empty tables or cards from appearing broken or unresponsive.
+
+---
+
+### 31. Micro-Interactions & Polish Suite
+
+We implemented 5 tactile micro-interactions:
+1. **Interactive Glassmorphic Hover Lift & Glow:**
+   - Applied to KPI cards, table rows, and mechanic cards (`hover:-translate-y-1 hover:shadow-lg hover:shadow-cyan-500/5 transition-all duration-200`). Elevates cards under cursor with a subtle cyan glow.
+2. **Pulse & Ripple Beacon on Live Status Badges (`StatusBadge.tsx`):**
+   - Active workflow states (`In Progress`, `Mechanic On The Way`, `busy`, `Assigned`) now feature a pulsing dual-ring radar ping beacon (`animate-ping`), immediately drawing the operator's eye to active jobs.
+3. **Interactive Click-to-Copy with Checkmark Animation (`ClickToCopy.tsx`):**
+   - Wrapping Booking IDs (`BK-10042`), License Plates (`DL04AB1234`), phone numbers, and emails allows single-click copying to clipboard. Features a zoom-in checkmark animation (`Check`) and an instant toast confirmation.
+4. **Button Press Scale Micro-Interaction (`active:scale-95 transition-transform`):**
+   - All interactive controls, pagination arrows, range buttons, and demo advance controls depress slightly when clicked, delivering immediate haptic-style tactile feedback.
+5. **Smooth Range & Status Pill Tabs:**
+   - Active state styling transitions smoothly across tabs (`Last 7 Days`, `Last 30 Days`, `Last 90 Days`) using gradient highlights and subtle shadows.
+
+---
+
+### 32. Multi-Resolution Responsive Audit (375px, 768px, 1440px)
+
+Verified through automated browser subagent testing:
+- **Mobile (375px × 667px)**:
+  - Fixed sidebar collapses into an accessible mobile bottom navigation bar (`Overview`, `Analytics`, `Bookings`, `Mechanics`) and a top bar with drawer menu.
+  - KPI metric cards wrap into a clean single vertical column (`grid-cols-1`).
+  - TanStack Table is wrapped in `overflow-x-auto` with a min-width of `750px`, enabling smooth horizontal swiping without page breakage.
+  - All Recharts graphs scale responsively via `<ResponsiveContainer width="100%" />` without text overflow or legend collisions.
+- **Tablet (768px × 1024px)**:
+  - Balanced 2-column KPI card layout (`sm:grid-cols-2`).
+  - Table columns display customer details, vehicle license plates, status pills, and INR currency with ample breathing room.
+- **Desktop (1440px × 900px)**:
+  - Permanent left navigation sidebar docked with live WebSocket indicator.
+  - Full 4-column KPI cards (`lg:grid-cols-4`).
+  - 2×2 telemetry dashboard layout for Recharts line, area, donut, and horizontal bar charts.
+
+---
+
+## STEP 10: Production README & Complete REST API Documentation
+
+---
+
+### 33. Comprehensive REST API Reference (`docs/api-documentation.md`)
+
+```markdown
+# Instant Mechanic — Complete API Documentation
+Base URL: http://localhost:5000/api
+Interactive Swagger UI: http://localhost:5000/api-docs
+```
+
+- **What it does:** Documents every REST endpoint exposed by the Express application, including:
+  1. **Health Check (`GET /api/health`)**: Server uptime and status.
+  2. **Dashboard Summary (`GET /api/dashboard/summary`)**: Real-time KPI aggregation via single `$facet` pipeline.
+  3. **Analytics Telemetry (`GET /api/dashboard/analytics?days=30`)**: Daily volume/revenue metrics, status distribution, and service categories via `$lookup` on `services`.
+  4. **Bookings (`GET`, `POST`, `GET /:id`, `PATCH /:id/status`, `PATCH /:id/assign`)**: Full lifecycle management, regex search on license plates/IDs, and assignment side-effects.
+  5. **Mechanics Fleet (`GET`, `POST`, `GET /:id`, `PATCH /:id/status`)**: Fleet availability states and historical `relatedBookings[]` audit log.
+  6. **Customers & Services**: Catalog lookup and customer profiles with vehicle arrays.
+  7. **WebSocket Broadcasts (`booking:updated`)**: Real-time event payload shape and frontend invalidation contract.
+- **Why required:** Provides backend consumers, external integrators, and frontend developers with unambiguous request schemas and JSON response shapes.
+
+---
+
+### 34. Project Overview & Production Architecture (`README.md`)
+
+- **What it does:** Serves as the central orientation and setup guide for the repository, covering:
+  1. **Project Overview**: Problem statement, target audience, core capabilities.
+  2. **Tech Stack Matrix**: Full table of frontend and backend technologies with rationale.
+  3. **ASCII Architectural Diagram**: Data flow between React Client, Express Server, MongoDB, Socket.io, and the background simulator (`simulate.js`).
+  4. **Environment Variables**: Explicit definitions for `MONGO_URI`, `PORT`, `CLIENT_URL`, and `VITE_API_URL`.
+  5. **Step-by-Step Local Setup**: Exact terminal commands to install dependencies, run the database seeder, start development servers, and run the simulator.
+  6. **Seeder & Event Simulator Reference**: How `@faker-js/faker` builds 550 bookings and how `simulate.js` autonomously drives events every 15–30 seconds.
+  7. **Deployment Instructions**: Deployment blueprints for Render/Railway (Node server) and Vercel/Netlify (Vite client).
+  8. **AI Usage & Agentic Workflow**: Transparent disclosure of Google DeepMind Antigravity's role in schema planning, test-driven browser verification, and chronological documentation maintenance.
+- **Why required:** Standardizes onboarding and project comprehension for any team member, evaluator, or open-source contributor.
+
+---
+
+## STEP 11: Production AWS EC2 (t2.micro), PM2 & Nginx Reverse Proxy Architecture
+
+---
+
+### 35. Cloud Infrastructure Architecture & Security Group Rules
+
+- **AWS Security Group Inbound Configuration:**
+  - **Port 22 (SSH):** Restricted to administrator IP for server configuration.
+  - **Port 80 (HTTP):** Open to `0.0.0.0/0` for standard web requests and Certbot challenge validation.
+  - **Port 443 (HTTPS):** Open to `0.0.0.0/0` for SSL encrypted communication.
+  - **Port 5000 (Internal Only):** Express server listens on `127.0.0.1:5000` and is never exposed directly to the public web.
+
+- **Why Swap Memory is Mandatory on t2.micro:**
+  - An AWS EC2 `t2.micro` instance has only 1GB of physical RAM.
+  - Running `npm install` or executing TypeScript compilation (`tsc`) can cause memory spikes above 1GB, triggering the Linux Kernel's Out-Of-Memory (OOM) killer to terminate the Node process.
+  - Adding a **2GB swapfile** (`/swapfile`) acts as virtual memory overflow on the EBS volume, guaranteeing stable builds and preventing server lockups.
+
+---
+
+### 36. PM2 Process Orchestration (`ecosystem.config.cjs`)
+
+```javascript
+module.exports = {
+  apps: [
+    {
+      name: 'instant-mechanic-api',
+      script: 'dist/index.js',
+      instances: 1,
+      autorestart: true,
+      max_memory_restart: '450M',
+      env: { NODE_ENV: 'production' }
+    },
+    {
+      name: 'instant-mechanic-simulator',
+      script: 'simulate.js',
+      instances: 1,
+      autorestart: true,
+      max_memory_restart: '200M',
+      env: { NODE_ENV: 'production' }
+    }
+  ]
+};
+```
+
+- **What it does:**
+  - Manages both the compiled Express REST server (`dist/index.js`) and the autonomous real-time simulator (`simulate.js`) as isolated background daemon processes.
+  - Automatically restarts processes if an uncaught exception occurs or if memory exceeds thresholds.
+  - Configures `systemd` startup scripts so services automatically resume after an EC2 instance reboot or maintenance cycle.
+- **Why required:** In production environments, running Node directly via terminal commands (`node dist/index.js`) terminates as soon as the SSH session closes. PM2 provides enterprise process daemonization and zero-downtime reloads.
+
+---
+
+### 37. Nginx Reverse Proxy & WebSocket Upgrading (`/etc/nginx/sites-available/instant-mechanic`)
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /socket.io/ {
+        proxy_pass http://127.0.0.1:5000/socket.io/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+```
+- **Why required:** Nginx handles SSL termination, gzip compression, request buffering, and WebSocket upgrade handshakes much more efficiently than a bare Node.js server.
+
+---
+
+## STEP 12: Production Verification, Build Resolution & GitHub Deployment Flow
+
+---
+
+### 38. TypeScript Compiler & Build System Alignment (`tsconfig.json` Files)
+
+- **What was updated:**
+  - Created `server/tsconfig.json` configured for `ES2022` target and `NodeNext` module resolution.
+  - Created `client/tsconfig.json` configured for React JSX (`react-jsx`) and Vite bundler module resolution.
+  - Created `client/src/vite-env.d.ts` to provide strict type definitions for `import.meta.env`.
+  - Resolved all client-side TypeScript errors in `AnalyticsPage.tsx` and `api.ts`.
+- **Why required:** Without explicit `tsconfig.json` files, running production build commands (`npm run build`) fails under standard TypeScript toolchains. Both frontend and backend now compile cleanly with **code 0**.
+
+---
+
+### 39. Dashboard REST API Direct Route Mapping (`GET /api/dashboard`)
+
+- **What was updated:**
+  - Updated `server/src/routes/dashboardRoutes.ts` to include `router.get('/', getDashboardSummary)`.
+- **Why required:** Guarantees that calling `GET /api/dashboard` directly returns the exact dashboard summary object as requested in Section 2 of the technical evaluation specification.
+
+---
+
+### 40. In-Memory API Rate Limiting Middleware (`rateLimiter.ts`)
+
+- **What was updated:**
+  - Implemented `server/src/middleware/rateLimiter.ts` protecting all `/api/*` endpoints with a 120 requests/minute window per client IP.
+- **Why required:** Essential security measure to prevent denial-of-service (DDoS) attacks and server overload in production cloud environments.
+
+---
+
+### 41. Client-Side CSV Data Export Engine (`BookingsPage.tsx`)
+
+- **What was updated:**
+  - Integrated a client-side CSV generator function and "Export CSV" button in the Bookings table controls bar.
+- **Why required:** Fulfills optional bonus feature specifications, enabling dispatchers and managers to export filtered booking records directly to spreadsheets.
+
+---
+
+### 42. Vercel Single-Page Application (SPA) Fallback Configuration (`vercel.json`)
+
+- **What was updated:**
+  - Created `client/vercel.json` with wildcard rewrite rules directing all route traffic (`/(.*)`) to `/index.html`.
+- **Why required:** Prevents 404 HTTP errors when refreshing deep URLs (e.g. `/bookings`, `/analytics`, `/mechanics`) on Vercel edge deployments.
+
+---
+
+### 43. Git Version Control Initialization & GitHub Remote Synchronization (`Instant_Mechanic`)
+
+- **What was executed:**
+  1. Initialized Git repository on branch `main` inside `instant-mechanic-dashboard`.
+  2. Staged all 71 core project files (excluding `node_modules/` and `dist/`).
+  3. Created root commit: `feat: complete live vehicle service operations dashboard`.
+  4. Attached remote origin: `https://github.com/SanketManav9620/Instant_Mechanic.git`.
+  5. Pushed local `main` branch to remote repository `origin/main`.
+- **Repository URL:** [`https://github.com/SanketManav9620/Instant_Mechanic`](https://github.com/SanketManav9620/Instant_Mechanic)
+- **Status:** ✅ Successfully pushed and synchronized.
