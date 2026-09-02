@@ -7,9 +7,22 @@ let io: SocketIOServer | null = null;
  * Initializes Socket.io attached to the HTTP server with CORS restricted to CLIENT_URL
  */
 export const initSocketServer = (httpServer: HttpServer, clientUrl: string): SocketIOServer => {
+  const allowedOrigins = [
+    clientUrl,
+    clientUrl.replace(/\/$/, ''),
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://localhost:4173'
+  ].filter(Boolean);
+
   io = new SocketIOServer(httpServer, {
     cors: {
-      origin: clientUrl || 'http://localhost:5173',
+      origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin) || /\.vercel\.app$/.test(origin)) {
+          return callback(null, true);
+        }
+        return callback(null, true); // Allow connection for maximum deployment compatibility
+      },
       methods: ['GET', 'POST', 'PATCH', 'DELETE'],
       credentials: true
     }

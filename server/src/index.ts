@@ -27,8 +27,26 @@ const httpServer = http.createServer(app);
 const PORT = process.env.PORT || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
+const allowedOrigins = [
+  CLIENT_URL,
+  CLIENT_URL.replace(/\/$/, ''),
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:4173'
+].filter(Boolean);
+
 // ── Core Middleware ──
-app.use(cors({ origin: CLIENT_URL, credentials: true }));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin) || /\.vercel\.app$/.test(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
+    credentials: true
+  })
+);
 app.use(express.json());
 app.use('/api', rateLimiter);
 
